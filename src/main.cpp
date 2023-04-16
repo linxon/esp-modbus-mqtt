@@ -40,15 +40,23 @@ extern "C" {
 
 #include <Url.h>
 #include "esp_base.h"
+#include <rom/crc.h>
 #ifndef MODBUS_DISABLED
-#include <modbus_base.h>
+//#include <modbus_base.h>
+#include <hbjk_16d10_module/modbus_base.h>
 #endif  // MODBUS_DISABLED
 
 static char HOSTNAME[24] = "ESP-MM-FFFFFFFFFFFFFFFF";
 static const char __attribute__((__unused__)) *TAG = "Main";
 
 // static const char *FIRMWARE_URL = "https://domain.com/path/file.bin";
-static const char *FIRMWARE_VERSION = "000.000.024";
+static const char *FIRMWARE_VERSION = "000.001.027";
+
+static StaticJsonDocument<2000> json_doc_poll;  // instanciate JSON storage for poller
+static StaticJsonDocument<2000> json_doc_main;  // instanciate JSON storage for receiver
+static char mb_main_json_buffer[MB_BUFFER_SIZE];
+
+static struct tm time_d;
 
 // instanciate WiFiManager object
 WiFiManager wifiManager;
@@ -60,12 +68,22 @@ AsyncMqttClient mqtt_client;
 TimerHandle_t mqtt_reconnect_timer;
 TimerHandle_t wifi_reconnect_timer;
 TimerHandle_t modbus_poller_timer;
-bool modbus_poller_inprogress = false;
 
 // instanciate task handlers
 TaskHandle_t modbus_poller_task_handler = NULL;
+TaskHandle_t modbus_main_task_handler = NULL;
 TaskHandle_t ota_update_task_handler = NULL;
 
+SemaphoreHandle_t modbus_poller_semaphore = NULL;
+SemaphoreHandle_t modbus_main_semaphore = NULL;
+
+static bool volatile modbus_poller_busy = false;
+static bool volatile modbus_main_busy = false;
+
+QueueHandle_t json_data_queue = NULL;
+
+static uint16_t volatile modbus_poller_last_crc16_v;
+static bool volatile modbus_poller_force_crc16_chk = false;
 
 void resetWiFi() {
   // Set WiFi to station mode
@@ -93,12 +111,14 @@ void wiFiEvent(WiFiEvent_t event) {
       if (!MDNS.begin(HOSTNAME)) {  // init mdns
         ESP_LOGW(TAG, "Error setting up MDNS responder");
       }
-      configTime(0, 0, "pool.ntp.org");  // init UTC time
-      struct tm now;
-      if (getLocalTime(&now)) {
+
+      // часы нужны, чтобы работали TLS сертификаты
+      configTime(3600, 7200, NTP_SERVER_1, NTP_SERVER_2, NTP_SERVER_3);  // init UTC time
+      
+      if (getLocalTime(&time_d)) {
         ESP_LOGI(TAG, "Time: %4d-%02d-%02d %02d:%02d:%02d",
-          now.tm_year+1900, now.tm_mon+1, now.tm_mday,
-          now.tm_hour, now.tm_min, now.tm_sec);
+          time_d.tm_year+1900, time_d.tm_mon+1, time_d.tm_mday,
+          time_d.tm_hour, time_d.tm_min, time_d.tm_sec);
       } else {
         ESP_LOGW(TAG, "Failed to obtain time");
       }
@@ -106,7 +126,8 @@ void wiFiEvent(WiFiEvent_t event) {
       break;
     case SYSTEM_EVENT_STA_DISCONNECTED:
       ESP_LOGW(TAG, "WiFi lost connection");
-      xTimerStop(mqtt_reconnect_timer, 0);  // ensure we don't reconnect to MQTT while reconnecting to Wi-Fi
+      xTimerStop(modbus_poller_timer, 0);
+      xTimerStop(mqtt_reconnect_timer, 0);
       xTimerStart(wifi_reconnect_timer, 0);
       break;
     default:
@@ -115,18 +136,39 @@ void wiFiEvent(WiFiEvent_t event) {
 }
 
 void onMqttConnect(bool sessionPresent) {
+  String mqtt_topic;
+
   ESP_LOGI(TAG, "Connected to MQTT");
   ESP_LOGD(TAG, "Session present: %s", sessionPresent ? "true" : "false");
 
-  String mqtt_topic = MQTT_TOPIC;
-  mqtt_topic += "/" + String(HOSTNAME) + "/action/#";
+  mqtt_topic = MQTT_TOPIC;
+  mqtt_topic += "/" + String(HOSTNAME) + "/set";
   ESP_LOGI(TAG, "Subscribing at %s", mqtt_topic.c_str());
-  // uint16_t packetIdSub = mqtt_client.subscribe(mqtt_topic.c_str(), 1);
   mqtt_client.subscribe(mqtt_topic.c_str(), 1);
+
+  mqtt_topic = MQTT_TOPIC;
+  mqtt_topic += "/" + String(HOSTNAME) + "/get";
+  ESP_LOGI(TAG, "Subscribing at %s", mqtt_topic.c_str());
+  mqtt_client.subscribe(mqtt_topic.c_str(), 1);
+
+  /*
+  mqtt_topic = MQTT_TOPIC;
+  mqtt_topic += "/" + String(HOSTNAME) + "/upgrade";
+  ESP_LOGI(TAG, "Subscribing at %s", mqtt_topic.c_str());
+  mqtt_client.subscribe(mqtt_topic.c_str(), 1);
+  */
+
+  if (xTimerStart(modbus_poller_timer, 0) != pdPASS) {
+    // The timer could not be set into the Active state
+  }
 }
 
 void onMqttDisconnect(AsyncMqttClientDisconnectReason reason) {
   ESP_LOGW(TAG, "Disconnected from MQTT");
+
+  if (xTimerStop(modbus_poller_timer, 0) != pdPASS) {
+    // The timer could not be set into the Active state
+  }
 
   if (WiFi.isConnected()) {
     xTimerStart(mqtt_reconnect_timer, 0);
@@ -146,51 +188,54 @@ void onMqttMessage(char *topic, char *payload,
   ESP_LOGV(TAG, "Message received (topic=%s, qos=%d, dup=%d, retain=%d, len=%d, index=%d, total=%d): %s",
     topic, properties.qos, properties.dup, properties.retain, len, index, total, payload);
 
-  String suffix = String(topic).substring(strlen(MQTT_TOPIC) + strlen(HOSTNAME) + 9);
-          // substring(1 + strlen(MQTT_TOPIC) + strlen("/") + strlen(HOSTNAME) + strlen("/") + strlen("action"))
-  ESP_LOGV(TAG, "MQTT topic suffix=%s", suffix.c_str());
+  String suffix = String(topic).substring(strlen(MQTT_TOPIC) + strlen(HOSTNAME) + 2);
+  
+  ESP_LOGI(TAG, "MQTT msg suffix=%s data=%s", suffix.c_str(), payload);
 
   if (suffix == "upgrade") {
+
+    // нахой ненадо пока...
     ESP_LOGD(TAG, "MQTT OTA update requested");
-    vTaskResume(ota_update_task_handler);
-    return;
-/*
-// TODO(gmasse): fix esp_log_level_set
-  } else if (suffix == "loglevel") {
-    ESP_LOGD(TAG, "MQTT log level update requested");
-    uint8_t log_level_nb;
-    if (sscanf(payload, "%hhu", &log_level_nb) == 1) {
-      switch (log_level_nb) {
-        case 0:
-          esp_log_level_set("*", ESP_LOG_NONE);
-          ESP_LOGI(TAG, "Log level changed to %#x", ESP_LOG_NONE);
-          break;
-        case 1:
-          esp_log_level_set("*", ESP_LOG_ERROR);
-          ESP_LOGI(TAG, "Log level changed to %#x", ESP_LOG_ERROR);
-          break;
-        case 2:
-          esp_log_level_set("*", ESP_LOG_WARN);
-          ESP_LOGI(TAG, "Log level changed to %#x", ESP_LOG_WARN);
-          break;
-        case 3:
-          esp_log_level_set("*", ESP_LOG_INFO);
-          ESP_LOGI(TAG, "Log level changed to %#x", ESP_LOG_INFO);
-          break;
-        case 4:
-          esp_log_level_set("*", ESP_LOG_DEBUG);
-          ESP_LOGI(TAG, "Log level changed to %#x", ESP_LOG_DEBUG);
-          break;
-        case 5:
-          esp_log_level_set("*", ESP_LOG_VERBOSE);
-          ESP_LOGI(TAG, "Log level changed to %#x", ESP_LOG_VERBOSE);
-          break;
-        default:
-          ESP_LOGE(TAG, "MQTT Invalid requested log level: %s (expected 0 to 5)", payload);
-          break;
+    //vTaskResume(ota_update_task_handler);
+
+  } else if (suffix == "get") {
+
+    if (xTimerStop(modbus_poller_timer, 0) == pdFAIL) {
+      ESP_LOGW(TAG, "Unable to reset Modbus Poller timer");
+    }
+
+    modbus_poller_force_crc16_chk = true;
+
+    if (modbus_main_busy == false) {
+      xSemaphoreGive(modbus_poller_semaphore);
+    }
+
+    if (modbus_poller_busy == false) {
+      modbus_poller_busy = true;
+      vTaskResume(modbus_poller_task_handler);
+    }
+
+  } else if (suffix == "set") {
+
+    if (xTimerStop(modbus_poller_timer, 10) == pdFAIL) {
+      ESP_LOGW(TAG, "Unable to stop Modbus Poller timer");
+    }
+
+    if (modbus_main_busy == false) {
+      modbus_main_busy = true;
+      vTaskResume(modbus_main_task_handler);
+    }
+
+    if (xQueueSend(json_data_queue, payload, 0) != pdPASS) {
+      ESP_LOGW(TAG, "Unable to send queue for Modbus Main Task");
+    }
+
+    if (modbus_poller_busy == false) {
+      if (xSemaphoreGive(modbus_main_semaphore) != pdTRUE) {
+        ESP_LOGW(TAG, "Unable to give semaphore for Modbus Main Task");
       }
     }
-*/
+
   } else {
     ESP_LOGW(TAG, "Unknow MQTT topic received: %s", topic);
   }
@@ -200,9 +245,10 @@ void onMqttPublish(uint16_t packetId) {
   ESP_LOGD(TAG, "Publish acknowledged for packetId: %d", packetId);
 }
 
+/*
 void runOtaUpdateTask(void * pvParameters) {
   UBaseType_t __attribute__((__unused__)) uxHighWaterMark;
-  /* Inspect our own high water mark on entering the task. */
+
   uxHighWaterMark = uxTaskGetStackHighWaterMark(NULL);
   ESP_LOGV(TAG, "Entering OTA task. Unused stack size: %d", uxHighWaterMark);
 
@@ -242,45 +288,148 @@ void runOtaUpdateTask(void * pvParameters) {
     }
   }
 }
+*/
 
 void runModbusPollerTask(void * pvParameters) {
 #ifndef MODBUS_DISABLED
+
+  uint16_t curr_crc16_v = 0x0000;
+
   UBaseType_t __attribute__((__unused__)) uxHighWaterMark;
   /* Inspect our own high water mark on entering the task. */
   uxHighWaterMark = uxTaskGetStackHighWaterMark(NULL);
   ESP_LOGV(TAG, "Entering Modbus Poller task. Unused stack size: %d", uxHighWaterMark);
 
+  vTaskSuspend(modbus_poller_task_handler);
+
   for (;;) {
     uxHighWaterMark = uxTaskGetStackHighWaterMark(NULL);
-    ESP_LOGV(TAG, "Suspending Modbus Poller task. Unused stack size: %d", uxHighWaterMark);
-    vTaskSuspend(NULL);  // Task is suspended by default
 
-    ESP_LOGV(TAG, "Resuming Modbus Poller task");
-    if (modbus_poller_inprogress) {  // not sure if needed
-      ESP_LOGV(TAG, "Modbus polling in already progress. Waiting for next cycle.");
-      return;
+    if (xTimerStop(modbus_poller_timer, 0) == pdFAIL) {
+      ESP_LOGW(TAG, "Unable to stop Modbus Poller timer");
     }
 
-    StaticJsonDocument<2000> json_doc;  // instanciate JSON storage
-    parseModbusToJson(json_doc.to<JsonVariant>());
+    if (xSemaphoreTake(modbus_poller_semaphore, 10000 / portTICK_PERIOD_MS) != pdTRUE) {
+      ESP_LOGW(TAG, "Unable to take semaphore for Modbus Poller Task");
+    }
 
-    char buffer[1600];
-    size_t n = serializeJson(json_doc, buffer);
+    parseModbusToJson(json_doc_poll.as<JsonVariant>());
+
+    char buffer[MB_BUFFER_SIZE];
+    size_t n = serializeJson(json_doc_poll, buffer);
     ESP_LOGD(TAG, "JSON serialized: %s", buffer);
+
+    if ((curr_crc16_v = crc16_le(0, (uint8_t *) buffer, MB_BUFFER_SIZE)) == modbus_poller_last_crc16_v
+          && modbus_poller_force_crc16_chk == false)
+    {
+      goto MB_POLLER_SKIP_MQTT;
+    }
+
+    modbus_poller_last_crc16_v = curr_crc16_v;
+    modbus_poller_force_crc16_chk = false;
+
     if (mqtt_client.connected()) {
       String mqtt_topic = MQTT_TOPIC;
-      mqtt_topic += "/" + String(HOSTNAME) + "/data";
+      mqtt_topic += "/" + String(HOSTNAME) + "/current";
       ESP_LOGI(TAG, "MQTT Publishing data to topic: %s", mqtt_topic.c_str());
-      mqtt_client.publish(mqtt_topic.c_str(), 0, true, buffer, n);
+      mqtt_client.publish(mqtt_topic.c_str(), 2, true, buffer, n);
     }
+
+MB_POLLER_SKIP_MQTT:
+    if (modbus_main_busy == true) {
+      xSemaphoreGive(modbus_main_semaphore);
+    } else {
+      if (xTimerStart(modbus_poller_timer, 0) == pdFAIL) {
+        ESP_LOGW(TAG, "Unable to start Modbus Poller timer");
+      }
+    }
+
+    modbus_poller_busy = false;
+
+    ESP_LOGV(TAG, "Suspending Modbus Poller task. Unused stack size: %d", uxHighWaterMark);
+    vTaskSuspend(NULL);
   }
 #endif  // MODBUS_DISABLED
 }
 
 void runModbusPollerTimer() {
-  ESP_LOGV(TAG, "Time to resume Modbus Poller");
-  vTaskResume(modbus_poller_task_handler);
-  ESP_LOGV(TAG, "Modbus Poller resume done");
+  if (modbus_main_busy == false) {
+    if (xSemaphoreGive(modbus_poller_semaphore) != pdTRUE) {
+      ESP_LOGW(TAG, "Unable to give semaphore for Modbus Poller Task");
+    }
+  }
+
+  if (modbus_poller_busy == false) {
+    ESP_LOGV(TAG, "Time to resume Modbus Poller");
+
+    modbus_poller_busy = true;
+    vTaskResume(modbus_poller_task_handler);
+  }
+}
+
+void runModbusMainTask(void *pvParameters) {
+#ifndef MODBUS_DISABLED
+
+  UBaseType_t __attribute__((__unused__)) uxHighWaterMark;
+  /* Inspect our own high water mark on entering the task. */
+  uxHighWaterMark = uxTaskGetStackHighWaterMark(NULL);
+  ESP_LOGV(TAG, "Entering Modbus Main task. Unused stack size: %d", uxHighWaterMark);
+
+  vTaskSuspend(modbus_main_task_handler);
+
+  for (;;) {
+
+    uxHighWaterMark = uxTaskGetStackHighWaterMark(NULL);
+
+    // максимальное ожидание команды алисы - 2.5 сек.
+    if (xQueueReceive(json_data_queue, mb_main_json_buffer, 2500u / portTICK_PERIOD_MS) == pdFALSE) {
+      ESP_LOGD(TAG, "End of Queue is reched in Modbus Main Task");
+    } else {
+      ESP_LOGD(TAG, "MAIN JSON BUFF: %s", mb_main_json_buffer);
+      modbus_main_busy == true;
+    }
+
+    if (modbus_main_busy == false) {
+      if (modbus_poller_busy == true) {
+        xSemaphoreGive(modbus_poller_semaphore); // поллер занят и наверняка ждет, когда мы ему повзволим работать
+      } else {
+        // запускаем таймер поллера в работу
+        if (xTimerStart(modbus_poller_timer, 10) == pdFAIL) {
+          ESP_LOGW(TAG, "Unable to start Modbus Poller timer");
+        }
+      }
+
+      ESP_LOGV(TAG, "Suspending Modbus Main task. Unused stack size: %d", uxHighWaterMark);
+      vTaskSuspend(NULL);
+
+      continue;
+    }
+
+    if (xSemaphoreTake(modbus_main_semaphore, 10000 / portTICK_PERIOD_MS) != pdTRUE) {
+      ESP_LOGW(TAG, "Unable to take semaphore for Modbus Main Task");
+    }
+
+    deserializeJson(json_doc_main, mb_main_json_buffer);
+    parseJsonToModbus_single(json_doc_main.as<JsonVariant>());
+
+    // получаем информацию о текущем состоянии целевого порта
+    if (modbusGetState_target(json_doc_main.as<JsonVariant>())) {
+      char buff_temp[MB_BUFFER_SIZE];
+      size_t n = serializeJson(json_doc_main, buff_temp);
+
+      if (mqtt_client.connected()) {
+        String mqtt_topic = MQTT_TOPIC;
+        mqtt_topic += "/" + String(HOSTNAME) + "/res";
+        ESP_LOGI(TAG, "MQTT Publishing data to topic: %s", mqtt_topic.c_str());
+        mqtt_client.publish(mqtt_topic.c_str(), 2, false, buff_temp, n);
+      }
+    } else {
+      ESP_LOGE(TAG, "Error while getting target state!");
+    }
+
+    modbus_main_busy = false; // в любом случае ставим false
+  }
+#endif  // MODBUS_DISABLED
 }
 
 void setup() {
@@ -328,31 +477,51 @@ void setup() {
   mqtt_client.onMessage(onMqttMessage);
   mqtt_client.onPublish(onMqttPublish);
 
+/*
+  gpio_config_t io_conf;
+  io_conf.intr_type = GPIO_INTR_DISABLE;
+  io_conf.mode = GPIO_MODE_INPUT;
+  io_conf.pull_up_en = GPIO_PULLUP_ENABLE;
+  io_conf.pin_bit_mask = GPIO_PIN25_CONFIG_M;
+  gpio_config(&io_conf);
+*/
   IPAddress mqtt_ip;
-  mqtt_ip.fromString(MQTT_HOST_IP);
-  mqtt_client.setServer(mqtt_ip, MQTT_PORT);
+
+  // внешний пин определяет режим подключения к MQTT серверу
+/*  if (gpio_get_level(GPIO_NUM_25) == false) { // подключаемся к локальному брокеру
+    
+    mqtt_ip.fromString(MQTT_LOCAL_IP);
+    mqtt_client.setServer(mqtt_ip, MQTT_LOCAL_PORT);
+    mqtt_client.setCredentials(MQTT_LOCAL_USERNAME, MQTT_LOCAL_PASSWD);
+
+  } else { // или к профилю по умолчанию
+*/
+    mqtt_ip.fromString(MQTT_HOST_IP);
+    mqtt_client.setServer(mqtt_ip, MQTT_PORT);
+    mqtt_client.setCredentials(MQTT_USERNAME, MQTT_PASSWD);
+//  }
 
   wifiManager.autoConnect();
 
 #ifndef MODBUS_DISABLED
-  initModbus();
+  modbus_poller_semaphore = xSemaphoreCreateBinary();
+  modbus_main_semaphore = xSemaphoreCreateBinary();
+  json_data_queue = xQueueCreate(5u, sizeof(mb_main_json_buffer));
 
-  xTaskCreate(runModbusPollerTask, "modbus_poller", 5900, NULL, 1, &modbus_poller_task_handler);
+  initModbus(MODBUS_UNIT);
+
+  xTaskCreate(runModbusPollerTask, "modbus_poller", 5900u, NULL, 2, &modbus_poller_task_handler);
   configASSERT(modbus_poller_task_handler);
 
-  modbus_poller_timer = xTimerCreate("modbus_poller_timer", pdMS_TO_TICKS(MODBUS_SCANRATE*1000), pdTRUE, NULL,
-    reinterpret_cast<TimerCallbackFunction_t>(runModbusPollerTimer));
-  if (modbus_poller_timer == NULL) {
-    // The timer was not created
-  } else {
-    if (xTimerStart(modbus_poller_timer, 0) != pdPASS) {
-      // The timer could not be set into the Active state
-    }
-  }
+  xTaskCreate(runModbusMainTask, "modbus_main", 5900u, NULL, 2, &modbus_main_task_handler);
+  configASSERT(modbus_main_task_handler);
 #endif  // MODBUS_DISABLED
 
-  xTaskCreate(runOtaUpdateTask, "ota_update", 4500, NULL, 2, &ota_update_task_handler);
-  configASSERT(ota_update_task_handler);
+  modbus_poller_timer = xTimerCreate("modbus_poller_timer", pdMS_TO_TICKS((MODBUS_SCANRATE)*5u), pdTRUE, NULL,
+    reinterpret_cast<TimerCallbackFunction_t>(runModbusPollerTimer));
+
+  //xTaskCreate(runOtaUpdateTask, "ota_update", 4500u, NULL, 2, &ota_update_task_handler);
+  //configASSERT(ota_update_task_handler);
 }
 
 void loop() {

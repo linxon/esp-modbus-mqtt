@@ -22,10 +22,19 @@
 #include <ModbusMaster.h>
 #include <ArduinoJson.h>
 
+typedef bool modbus_state_target_t;
+
 void preTransmission();
 void postTransmission();
-void initModbus();
-void readModbusRegisterToJson(uint16_t register_id, ArduinoJson::JsonVariant variant);
+void initModbus(uint8_t slave_id);
+void readModbusRegisterToJson(uint16_t idx, uint16_t register_id, ArduinoJson::JsonVariant variant);
+void writeJsonToModbusRegisters(uint16_t idx, uint16_t register_id, ArduinoJson::JsonVariant variant);
 void parseModbusToJson(ArduinoJson::JsonVariant variant);
+modbus_state_target_t modbusGetState_target(ArduinoJson::JsonVariant variant);
+void parseJsonToModbus_single(ArduinoJson::JsonVariant variant);
+void parseJsonToModbus_multiple(ArduinoJson::JsonVariant variant);
+
+void jk16_d10_set_DO_port(uint16_t port_id, bool state);
+bool jk16_d10_get_DI_port(uint16_t port_id);
 
 #endif  // SRC_MODBUS_BASE_H_

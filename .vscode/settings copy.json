@@ -1,0 +1,8 @@
+    {
+        "terminal.integrated.env.windows": {
+            "PIO_FIRMWARE_URL": "https://url/firmware.bin",
+            "PIO_MQTT_HOST_IP": "192.168.1.1",
+            "PIO_MQTT_PORT": "1883",
+            "PIO_MQTT_TOPIC": "esp32"
+          },
+    }
