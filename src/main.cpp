@@ -303,6 +303,9 @@ void runModbusPollerTask(void * pvParameters) {
   vTaskSuspend(modbus_poller_task_handler);
 
   for (;;) {
+    char json_buffer[MB_BUFFER_SIZE] = {0};
+    size_t buff_size = 0;
+
     uxHighWaterMark = uxTaskGetStackHighWaterMark(NULL);
 
     if (xTimerStop(modbus_poller_timer, 0) == pdFAIL) {
@@ -315,16 +318,15 @@ void runModbusPollerTask(void * pvParameters) {
 
     parseModbusToJson(json_doc_poll.as<JsonVariant>());
 
-    char buffer[MB_BUFFER_SIZE];
-    size_t n = serializeJson(json_doc_poll, buffer);
-    ESP_LOGD(TAG, "JSON serialized: %s", buffer);
-
-    if (String(buffer) == "null") {
-      ESP_LOGE(TAG, "Error: buffer is empty!");
+    if (json_doc_poll.isNull()) {
+      ESP_LOGE(TAG, "Error: modbus device is not responding!");
       goto MB_POLLER_SKIP_MQTT;
     }
 
-    if ((curr_crc16_v = crc16_le(0, (uint8_t *) buffer, MB_BUFFER_SIZE)) == modbus_poller_last_crc16_v
+    buff_size = serializeJson(json_doc_poll, json_buffer);
+    ESP_LOGD(TAG, "JSON serialized: %s", json_buffer);
+
+    if ((curr_crc16_v = crc16_le(0, (uint8_t *) json_buffer, MB_BUFFER_SIZE)) == modbus_poller_last_crc16_v
           && modbus_poller_force_crc16_chk == false)
     {
       goto MB_POLLER_SKIP_MQTT;
@@ -337,7 +339,7 @@ void runModbusPollerTask(void * pvParameters) {
       String mqtt_topic = MQTT_TOPIC;
       mqtt_topic += "/" + String(HOSTNAME) + "/current";
       ESP_LOGI(TAG, "MQTT Publishing data to topic: %s", mqtt_topic.c_str());
-      mqtt_client.publish(mqtt_topic.c_str(), 2, true, buffer, n);
+      mqtt_client.publish(mqtt_topic.c_str(), 2, true, json_buffer, buff_size);
     }
 
 MB_POLLER_SKIP_MQTT:
