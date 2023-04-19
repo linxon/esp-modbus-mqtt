@@ -319,6 +319,11 @@ void runModbusPollerTask(void * pvParameters) {
     size_t n = serializeJson(json_doc_poll, buffer);
     ESP_LOGD(TAG, "JSON serialized: %s", buffer);
 
+    if (String(buffer) == "null") {
+      ESP_LOGE(TAG, "Error: buffer is empty!");
+      goto MB_POLLER_SKIP_MQTT;
+    }
+
     if ((curr_crc16_v = crc16_le(0, (uint8_t *) buffer, MB_BUFFER_SIZE)) == modbus_poller_last_crc16_v
           && modbus_poller_force_crc16_chk == false)
     {
