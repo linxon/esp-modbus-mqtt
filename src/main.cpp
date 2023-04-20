@@ -77,9 +77,6 @@ TaskHandle_t ota_update_task_handler = NULL;
 SemaphoreHandle_t modbus_poller_semaphore = NULL;
 SemaphoreHandle_t modbus_main_semaphore = NULL;
 
-static bool volatile modbus_poller_busy = false;
-static bool volatile modbus_main_busy = false;
-
 QueueHandle_t json_data_queue = NULL;
 
 static uint16_t volatile modbus_poller_last_crc16_v;
@@ -206,12 +203,11 @@ void onMqttMessage(char *topic, char *payload,
 
     modbus_poller_force_crc16_chk = true;
 
-    if (modbus_main_busy == false) {
+    if (eTaskGetState(modbus_main_task_handler) == eSuspended) {
       xSemaphoreGive(modbus_poller_semaphore);
     }
 
-    if (modbus_poller_busy == false) {
-      modbus_poller_busy = true;
+    if (eTaskGetState(modbus_poller_task_handler) == eSuspended) {
       vTaskResume(modbus_poller_task_handler);
     }
 
@@ -221,8 +217,7 @@ void onMqttMessage(char *topic, char *payload,
       ESP_LOGW(TAG, "Unable to stop Modbus Poller timer");
     }
 
-    if (modbus_main_busy == false) {
-      modbus_main_busy = true;
+    if (eTaskGetState(modbus_main_task_handler) == eSuspended) {
       vTaskResume(modbus_main_task_handler);
     }
 
@@ -230,7 +225,7 @@ void onMqttMessage(char *topic, char *payload,
       ESP_LOGW(TAG, "Unable to send queue for Modbus Main Task");
     }
 
-    if (modbus_poller_busy == false) {
+    if (eTaskGetState(modbus_poller_task_handler) == eSuspended) {
       if (xSemaphoreGive(modbus_main_semaphore) != pdTRUE) {
         ESP_LOGW(TAG, "Unable to give semaphore for Modbus Main Task");
       }
@@ -343,15 +338,13 @@ void runModbusPollerTask(void * pvParameters) {
     }
 
 MB_POLLER_SKIP_MQTT:
-    if (modbus_main_busy == true) {
+    if (eTaskGetState(modbus_main_task_handler) != eSuspended) {
       xSemaphoreGive(modbus_main_semaphore);
     } else {
       if (xTimerStart(modbus_poller_timer, 0) == pdFAIL) {
         ESP_LOGW(TAG, "Unable to start Modbus Poller timer");
       }
     }
-
-    modbus_poller_busy = false;
 
     ESP_LOGV(TAG, "Suspending Modbus Poller task. Unused stack size: %d", uxHighWaterMark);
     vTaskSuspend(NULL);
@@ -360,16 +353,14 @@ MB_POLLER_SKIP_MQTT:
 }
 
 void runModbusPollerTimer() {
-  if (modbus_main_busy == false) {
+  if (eTaskGetState(modbus_main_task_handler) == eSuspended) {
     if (xSemaphoreGive(modbus_poller_semaphore) != pdTRUE) {
       ESP_LOGW(TAG, "Unable to give semaphore for Modbus Poller Task");
     }
   }
 
-  if (modbus_poller_busy == false) {
+  if (eTaskGetState(modbus_poller_task_handler) == eSuspended) {
     ESP_LOGV(TAG, "Time to resume Modbus Poller");
-
-    modbus_poller_busy = true;
     vTaskResume(modbus_poller_task_handler);
   }
 }
@@ -391,16 +382,11 @@ void runModbusMainTask(void *pvParameters) {
     // максимальное ожидание команды алисы - 2.5 сек.
     if (xQueueReceive(json_data_queue, mb_main_json_buffer, 2500u / portTICK_PERIOD_MS) == pdFALSE) {
       ESP_LOGD(TAG, "End of Queue is reched in Modbus Main Task");
-    } else {
-      ESP_LOGD(TAG, "MAIN JSON BUFF: %s", mb_main_json_buffer);
-      modbus_main_busy == true;
-    }
 
-    if (modbus_main_busy == false) {
-      if (modbus_poller_busy == true) {
-        xSemaphoreGive(modbus_poller_semaphore); // поллер занят и наверняка ждет, когда мы ему повзволим работать
+      if (eTaskGetState(modbus_poller_task_handler) != eSuspended) {
+        xSemaphoreGive(modbus_poller_semaphore); // поллер занят и наверняка ждет, когда мы ему позволим работать
       } else {
-        // запускаем таймер поллера в работу
+        // иначе запускаем таймер поллера в работу
         if (xTimerStart(modbus_poller_timer, 10) == pdFAIL) {
           ESP_LOGW(TAG, "Unable to start Modbus Poller timer");
         }
@@ -410,6 +396,8 @@ void runModbusMainTask(void *pvParameters) {
       vTaskSuspend(NULL);
 
       continue;
+    } else {
+      ESP_LOGD(TAG, "MAIN JSON BUFF: %s", mb_main_json_buffer);
     }
 
     if (xSemaphoreTake(modbus_main_semaphore, 10000 / portTICK_PERIOD_MS) != pdTRUE) {
@@ -433,8 +421,6 @@ void runModbusMainTask(void *pvParameters) {
     } else {
       ESP_LOGE(TAG, "Error while getting target state!");
     }
-
-    modbus_main_busy = false; // в любом случае ставим false
   }
 #endif  // MODBUS_DISABLED
 }
@@ -506,6 +492,7 @@ void setup() {
     mqtt_ip.fromString(MQTT_HOST_IP);
     mqtt_client.setServer(mqtt_ip, MQTT_PORT);
     mqtt_client.setCredentials(MQTT_USERNAME, MQTT_PASSWD);
+//    mqtt_client.setSecure(true);
 //  }
 
   wifiManager.autoConnect();
@@ -522,14 +509,15 @@ void setup() {
 
   xTaskCreate(runModbusMainTask, "modbus_main", 5900u, NULL, 2, &modbus_main_task_handler);
   configASSERT(modbus_main_task_handler);
-#endif  // MODBUS_DISABLED
 
   modbus_poller_timer = xTimerCreate("modbus_poller_timer", pdMS_TO_TICKS((MODBUS_SCANRATE)*5u), pdTRUE, NULL,
     reinterpret_cast<TimerCallbackFunction_t>(runModbusPollerTimer));
+#endif  // MODBUS_DISABLED
 
   //xTaskCreate(runOtaUpdateTask, "ota_update", 4500u, NULL, 2, &ota_update_task_handler);
   //configASSERT(ota_update_task_handler);
 }
 
 void loop() {
+  vTaskDelete(NULL);
 }
