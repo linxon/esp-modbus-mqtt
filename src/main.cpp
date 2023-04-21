@@ -57,6 +57,7 @@ static StaticJsonDocument<2000> json_doc_main;  // instanciate JSON storage for 
 static char mb_main_json_buffer[MB_MAX_BUFFER_SIZE];
 
 static struct tm time_d;
+static bool time_last_updated = false;
 
 // instanciate WiFiManager object
 WiFiManager wifiManager;
@@ -68,6 +69,7 @@ AsyncMqttClient mqtt_client;
 TimerHandle_t mqtt_reconnect_timer;
 TimerHandle_t wifi_reconnect_timer;
 TimerHandle_t modbus_poller_timer;
+TimerHandle_t ntp_update_timer;
 
 // instanciate task handlers
 TaskHandle_t modbus_poller_task_handler = NULL;
@@ -81,6 +83,9 @@ QueueHandle_t json_data_queue = NULL;
 
 static uint16_t volatile modbus_poller_last_crc16_v;
 static bool volatile modbus_poller_force_crc16_chk = false;
+
+void runModbusPollerTimer();
+void runNTPUpdateTimer();
 
 void resetWiFi() {
   // Set WiFi to station mode
@@ -109,22 +114,18 @@ void wiFiEvent(WiFiEvent_t event) {
         ESP_LOGW(TAG, "Error setting up MDNS responder");
       }
 
-      // часы нужны, чтобы работали TLS сертификаты
-      configTime(3600, 7200, NTP_SERVER_1, NTP_SERVER_2, NTP_SERVER_3);  // init UTC time
-      
-      if (getLocalTime(&time_d)) {
-        ESP_LOGI(TAG, "Time: %4d-%02d-%02d %02d:%02d:%02d",
-          time_d.tm_year+1900, time_d.tm_mon+1, time_d.tm_mday,
-          time_d.tm_hour, time_d.tm_min, time_d.tm_sec);
-      } else {
-        ESP_LOGW(TAG, "Failed to obtain time");
+      runNTPUpdateTimer(); // сразу же обновляем время при превом запуске
+      if (xTimerStart(ntp_update_timer, 0) == pdFAIL) {
+        ESP_LOGW(TAG, "Unable to start NTP Update timer");
       }
+
       connectToMqtt();
       break;
     case SYSTEM_EVENT_STA_DISCONNECTED:
       ESP_LOGW(TAG, "WiFi lost connection");
       xTimerStop(modbus_poller_timer, 0);
       xTimerStop(mqtt_reconnect_timer, 0);
+      xTimerStop(ntp_update_timer, 0);
       xTimerStart(wifi_reconnect_timer, 0);
       break;
     default:
@@ -333,17 +334,17 @@ void runModbusPollerTask(void * pvParameters) {
 
     // чтобы точно знать, когда последний раз был опубликован - фиксируем время
     if (getLocalTime(&time_d)) {
-      json_doc_poll["poller"]["publish_time"]["year"] = time_d.tm_year+1900;
-      json_doc_poll["poller"]["publish_time"]["mon"] = time_d.tm_mon+1;
-      json_doc_poll["poller"]["publish_time"]["day"] = time_d.tm_mday;
-      json_doc_poll["poller"]["publish_time"]["hour"] = time_d.tm_hour;
-      json_doc_poll["poller"]["publish_time"]["min"] = time_d.tm_min;
-      json_doc_poll["poller"]["publish_time"]["sec"] = time_d.tm_sec;
+      json_doc_poll["_poller"]["publish_time"]["year"] = time_d.tm_year+1900;
+      json_doc_poll["_poller"]["publish_time"]["mon"] = time_d.tm_mon+1;
+      json_doc_poll["_poller"]["publish_time"]["day"] = time_d.tm_mday;
+      json_doc_poll["_poller"]["publish_time"]["hour"] = time_d.tm_hour;
+      json_doc_poll["_poller"]["publish_time"]["min"] = time_d.tm_min;
+      json_doc_poll["_poller"]["publish_time"]["sec"] = time_d.tm_sec;
     }
 
     // для отслеживания изменения текущего состояния МБ устройства для сторонних MQTT клиентов
     // будем фиксировать последнюю хеш сумму в самом топике (Retain флаг включить надо)
-    json_doc_poll["poller"]["last_crc16"] = modbus_poller_last_crc16_v;
+    json_doc_poll["_poller"]["last_crc16"] = modbus_poller_last_crc16_v;
     buff_length = serializeJson(json_doc_poll, json_buffer);
 
     MQTT_CLIENT_PUBLISH_DATA(mqtt_client, "current", json_buffer, buff_length);
@@ -435,6 +436,45 @@ void runModbusMainTask(void *pvParameters) {
 #endif  // MODBUS_DISABLED
 }
 
+void runNTPUpdateTimer() {
+  time_t curr_time;
+  tm l_time_d;
+
+  if (time_last_updated) {
+    time_last_updated = false;
+    return; // пропускаем итерацию, чтобы не обновлялось в одну и ту же минуту
+  }
+
+  if (!WiFi.isConnected())
+    return;
+
+  time(&curr_time);
+  localtime_r(&curr_time, &l_time_d);
+
+  if (l_time_d.tm_year < (2016 - 1900) || (
+      l_time_d.tm_hour == 0 &&
+      l_time_d.tm_min == 0))
+  {
+    // часы нужны, чтобы работали TLS сертификаты
+    configTime(
+        TIME_GMT_OFFSET,
+        TIME_DAYLIGHT_OFFSET,
+        NTP_SERVER_1,
+        NTP_SERVER_2,
+        NTP_SERVER_3);  // init UTC time
+
+    if (getLocalTime(&time_d)) {
+      ESP_LOGI(TAG, "Date & time updated: %4d-%02d-%02d %02d:%02d:%02d",
+        time_d.tm_year+1900, time_d.tm_mon+1, time_d.tm_mday,
+        time_d.tm_hour, time_d.tm_min, time_d.tm_sec);
+
+      time_last_updated = true;
+    } else {
+      ESP_LOGW(TAG, "Failed to obtain date & time");
+    }
+  }
+}
+
 void setup() {
   // debug comm
   Serial.begin(MONITOR_SPEED);
@@ -523,6 +563,9 @@ void setup() {
   modbus_poller_timer = xTimerCreate("modbus_poller_timer", pdMS_TO_TICKS((MODBUS_SCANRATE)*5u), pdTRUE, NULL,
     reinterpret_cast<TimerCallbackFunction_t>(runModbusPollerTimer));
 #endif  // MODBUS_DISABLED
+
+  ntp_update_timer = xTimerCreate("ntp_update_timer", pdMS_TO_TICKS(60*1000), pdTRUE, NULL,
+    reinterpret_cast<TimerCallbackFunction_t>(runNTPUpdateTimer));
 
   //xTaskCreate(runOtaUpdateTask, "ota_update", 4500u, NULL, 2, &ota_update_task_handler);
   //configASSERT(ota_update_task_handler);
