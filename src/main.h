@@ -22,4 +22,20 @@
 #include "Arduino.h"
 #include "credentials.h"
 
+#define MB_MAX_BUFFER_SIZE     1600u
+
+#define NTP_SERVER_1    "0.ru.pool.ntp.org"
+#define NTP_SERVER_2    "1.ru.pool.ntp.org"
+#define NTP_SERVER_3    "2.ru.pool.ntp.org"
+
+#define MQTT_CLIENT_PUBLISH_DATA(mq_client, target_topic, buffer, length) \
+    do { \
+        if (mq_client.connected()) { \
+            String mqtt_topic = MQTT_TOPIC; \
+            mqtt_topic += "/" + String(HOSTNAME) + "/" + target_topic; \
+            ESP_LOGI(TAG, "MQTT Publishing data to topic: %s", mqtt_topic.c_str()); \
+            mq_client.publish(mqtt_topic.c_str(), 2, true, buffer, length); \
+        } \
+    } while (0)
+
 #endif  // SRC_MAIN_H_

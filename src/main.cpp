@@ -53,8 +53,8 @@ static const char __attribute__((__unused__)) *TAG = "Main";
 static const char *FIRMWARE_VERSION = "000.001.027";
 
 static StaticJsonDocument<2000> json_doc_poll;  // instanciate JSON storage for poller
-static StaticJsonDocument<2000> json_doc_main;  // instanciate JSON storage for receiver
-static char mb_main_json_buffer[MB_BUFFER_SIZE];
+static StaticJsonDocument<2000> json_doc_main;  // instanciate JSON storage for main task
+static char mb_main_json_buffer[MB_MAX_BUFFER_SIZE];
 
 static struct tm time_d;
 
@@ -187,7 +187,7 @@ void onMqttMessage(char *topic, char *payload,
 
   String suffix = String(topic).substring(strlen(MQTT_TOPIC) + strlen(HOSTNAME) + 2);
   
-  ESP_LOGI(TAG, "MQTT msg suffix=%s data=%s", suffix.c_str(), payload);
+  ESP_LOGD(TAG, "MQTT msg suffix=%s data=%s", suffix.c_str(), payload);
 
   if (suffix == "upgrade") {
 
@@ -197,18 +197,18 @@ void onMqttMessage(char *topic, char *payload,
 
   } else if (suffix == "get") {
 
-    if (xTimerStop(modbus_poller_timer, 0) == pdFAIL) {
-      ESP_LOGW(TAG, "Unable to reset Modbus Poller timer");
+    if (xTimerStop(modbus_poller_timer, 10) == pdFAIL) {
+      ESP_LOGW(TAG, "Unable to stpp Modbus Poller timer");
     }
 
     modbus_poller_force_crc16_chk = true;
 
-    if (eTaskGetState(modbus_main_task_handler) == eSuspended) {
-      xSemaphoreGive(modbus_poller_semaphore);
-    }
-
     if (eTaskGetState(modbus_poller_task_handler) == eSuspended) {
       vTaskResume(modbus_poller_task_handler);
+    }
+
+    if (eTaskGetState(modbus_main_task_handler) == eSuspended) {
+      xSemaphoreGive(modbus_poller_semaphore);
     }
 
   } else if (suffix == "set") {
@@ -287,6 +287,8 @@ void runOtaUpdateTask(void * pvParameters) {
 
 void runModbusPollerTask(void * pvParameters) {
 #ifndef MODBUS_DISABLED
+  char json_buffer[MB_MAX_BUFFER_SIZE] = {0};
+  size_t buff_length = 0;
 
   uint16_t curr_crc16_v = 0x0000;
 
@@ -298,9 +300,6 @@ void runModbusPollerTask(void * pvParameters) {
   vTaskSuspend(modbus_poller_task_handler);
 
   for (;;) {
-    char json_buffer[MB_BUFFER_SIZE] = {0};
-    size_t buff_size = 0;
-
     uxHighWaterMark = uxTaskGetStackHighWaterMark(NULL);
 
     if (xTimerStop(modbus_poller_timer, 0) == pdFAIL) {
@@ -311,6 +310,7 @@ void runModbusPollerTask(void * pvParameters) {
       ESP_LOGW(TAG, "Unable to take semaphore for Modbus Poller Task");
     }
 
+    json_doc_poll.clear(); // обязательно (!!!) очищаем JSON документ перед заполнением и проверкой CRC16
     parseModbusToJson(json_doc_poll.as<JsonVariant>());
 
     if (json_doc_poll.isNull()) {
@@ -318,24 +318,35 @@ void runModbusPollerTask(void * pvParameters) {
       goto MB_POLLER_SKIP_MQTT;
     }
 
-    buff_size = serializeJson(json_doc_poll, json_buffer);
+    buff_length = serializeJson(json_doc_poll, json_buffer);
     ESP_LOGD(TAG, "JSON serialized: %s", json_buffer);
 
-    if ((curr_crc16_v = crc16_le(0, (uint8_t *) json_buffer, MB_BUFFER_SIZE)) == modbus_poller_last_crc16_v
+    // публикуем только тогда, когда на МБ устройстве есть какие-либо изменения состояния портов
+    if ((curr_crc16_v = crc16_le(0, (uint8_t *) json_buffer, buff_length)) == modbus_poller_last_crc16_v
           && modbus_poller_force_crc16_chk == false)
     {
-      goto MB_POLLER_SKIP_MQTT;
+      goto MB_POLLER_SKIP_MQTT; // иначе пропускаем
     }
 
     modbus_poller_last_crc16_v = curr_crc16_v;
     modbus_poller_force_crc16_chk = false;
 
-    if (mqtt_client.connected()) {
-      String mqtt_topic = MQTT_TOPIC;
-      mqtt_topic += "/" + String(HOSTNAME) + "/current";
-      ESP_LOGI(TAG, "MQTT Publishing data to topic: %s", mqtt_topic.c_str());
-      mqtt_client.publish(mqtt_topic.c_str(), 2, true, json_buffer, buff_size);
+    // чтобы точно знать, когда последний раз был опубликован - фиксируем время
+    if (getLocalTime(&time_d)) {
+      json_doc_poll["poller"]["publish_time"]["year"] = time_d.tm_year+1900;
+      json_doc_poll["poller"]["publish_time"]["mon"] = time_d.tm_mon+1;
+      json_doc_poll["poller"]["publish_time"]["day"] = time_d.tm_mday;
+      json_doc_poll["poller"]["publish_time"]["hour"] = time_d.tm_hour;
+      json_doc_poll["poller"]["publish_time"]["min"] = time_d.tm_min;
+      json_doc_poll["poller"]["publish_time"]["sec"] = time_d.tm_sec;
     }
+
+    // для отслеживания изменения текущего состояния МБ устройства для сторонних MQTT клиентов
+    // будем фиксировать последнюю хеш сумму в самом топике (Retain флаг включить надо)
+    json_doc_poll["poller"]["last_crc16"] = modbus_poller_last_crc16_v;
+    buff_length = serializeJson(json_doc_poll, json_buffer);
+
+    MQTT_CLIENT_PUBLISH_DATA(mqtt_client, "current", json_buffer, buff_length);
 
 MB_POLLER_SKIP_MQTT:
     if (eTaskGetState(modbus_main_task_handler) != eSuspended) {
@@ -367,6 +378,8 @@ void runModbusPollerTimer() {
 
 void runModbusMainTask(void *pvParameters) {
 #ifndef MODBUS_DISABLED
+  char json_buffer[MB_MAX_BUFFER_SIZE] = {0};
+  size_t buff_length = 0;
 
   UBaseType_t __attribute__((__unused__)) uxHighWaterMark;
   /* Inspect our own high water mark on entering the task. */
@@ -379,7 +392,7 @@ void runModbusMainTask(void *pvParameters) {
 
     uxHighWaterMark = uxTaskGetStackHighWaterMark(NULL);
 
-    // максимальное ожидание команды алисы - 2.5 сек.
+    // максимальное ожидание команды Алисы - 2.5 сек.
     if (xQueueReceive(json_data_queue, mb_main_json_buffer, 2500u / portTICK_PERIOD_MS) == pdFALSE) {
       ESP_LOGD(TAG, "End of Queue is reched in Modbus Main Task");
 
@@ -409,15 +422,10 @@ void runModbusMainTask(void *pvParameters) {
 
     // получаем информацию о текущем состоянии целевого порта
     if (modbusGetState_target(json_doc_main.as<JsonVariant>())) {
-      char buff_temp[MB_BUFFER_SIZE];
-      size_t n = serializeJson(json_doc_main, buff_temp);
 
-      if (mqtt_client.connected()) {
-        String mqtt_topic = MQTT_TOPIC;
-        mqtt_topic += "/" + String(HOSTNAME) + "/res";
-        ESP_LOGI(TAG, "MQTT Publishing data to topic: %s", mqtt_topic.c_str());
-        mqtt_client.publish(mqtt_topic.c_str(), 2, false, buff_temp, n);
-      }
+      buff_length = serializeJson(json_doc_main, json_buffer);
+      MQTT_CLIENT_PUBLISH_DATA(mqtt_client, "res", json_buffer, buff_length);
+
     } else {
       ESP_LOGE(TAG, "Error while getting target state!");
     }
@@ -429,7 +437,7 @@ void setup() {
   // debug comm
   Serial.begin(MONITOR_SPEED);
   while (!Serial) continue;
-  Serial.setDebugOutput(true);
+  Serial.setDebugOutput(false);
 /*
 // TODO(gmasse): fix esp_log_level_set
   esp_log_level_set("*", ESP_LOG_VERBOSE);
