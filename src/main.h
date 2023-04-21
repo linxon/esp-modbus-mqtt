@@ -24,8 +24,8 @@
 
 #define MB_MAX_BUFFER_SIZE      1600u
 
-#define TIME_GMT_OFFSET         3600l
-#define TIME_DAYLIGHT_OFFSET    7200
+#define NTP_GMT_OFFSET         3600l
+#define NTP_DAYLIGHT_OFFSET    7200
 #define NTP_SERVER_1            "0.ru.pool.ntp.org"
 #define NTP_SERVER_2            "1.ru.pool.ntp.org"
 #define NTP_SERVER_3            "2.ru.pool.ntp.org"

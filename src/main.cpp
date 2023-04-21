@@ -438,7 +438,7 @@ void runModbusMainTask(void *pvParameters) {
 
 void runNTPUpdateTimer() {
   time_t curr_time;
-  tm l_time_d;
+  struct tm l_time_d;
 
   if (time_last_updated) {
     time_last_updated = false;
@@ -457,8 +457,8 @@ void runNTPUpdateTimer() {
   {
     // часы нужны, чтобы работали TLS сертификаты
     configTime(
-        TIME_GMT_OFFSET,
-        TIME_DAYLIGHT_OFFSET,
+        NTP_GMT_OFFSET,
+        NTP_DAYLIGHT_OFFSET,
         NTP_SERVER_1,
         NTP_SERVER_2,
         NTP_SERVER_3);  // init UTC time
