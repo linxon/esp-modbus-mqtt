@@ -198,7 +198,7 @@ void onMqttMessage(char *topic, char *payload,
   } else if (suffix == "get") {
 
     if (xTimerStop(modbus_poller_timer, 10) == pdFAIL) {
-      ESP_LOGW(TAG, "Unable to stpp Modbus Poller timer");
+      ESP_LOGW(TAG, "Unable to stop Modbus Poller timer");
     }
 
     modbus_poller_force_crc16_chk = true;
@@ -429,6 +429,8 @@ void runModbusMainTask(void *pvParameters) {
     } else {
       ESP_LOGE(TAG, "Error while getting target state!");
     }
+
+    json_doc_main.clear();
   }
 #endif  // MODBUS_DISABLED
 }
