@@ -86,6 +86,7 @@ static bool volatile modbus_poller_force_crc16_chk = false;
 
 void runModbusPollerTimer();
 void runNTPUpdateTimer();
+uint8_t strchr_cnt(const char *s, char character);
 
 void resetWiFi() {
   // Set WiFi to station mode
@@ -186,7 +187,7 @@ void onMqttMessage(char *topic, char *payload,
   ESP_LOGV(TAG, "Message received (topic=%s, qos=%d, dup=%d, retain=%d, len=%d, index=%d, total=%d): %s",
     topic, properties.qos, properties.dup, properties.retain, len, index, total, payload);
 
-  String suffix = String(topic).substring(strlen(MQTT_TOPIC) + strlen(HOSTNAME) + 2);
+  String suffix = String(topic).substring(strlen(MQTT_TOPIC) + strlen(HOSTNAME) + strchr_cnt(topic, '/'));
   
   ESP_LOGD(TAG, "MQTT msg suffix=%s data=%s", suffix.c_str(), payload);
 
@@ -334,12 +335,12 @@ void runModbusPollerTask(void * pvParameters) {
 
     // чтобы точно знать, когда последний раз был опубликован - фиксируем время
     if (getLocalTime(&time_d)) {
-      json_doc_poll["_poller"]["publish_time"]["year"] = time_d.tm_year+1900;
-      json_doc_poll["_poller"]["publish_time"]["mon"] = time_d.tm_mon+1;
-      json_doc_poll["_poller"]["publish_time"]["day"] = time_d.tm_mday;
-      json_doc_poll["_poller"]["publish_time"]["hour"] = time_d.tm_hour;
-      json_doc_poll["_poller"]["publish_time"]["min"] = time_d.tm_min;
-      json_doc_poll["_poller"]["publish_time"]["sec"] = time_d.tm_sec;
+      json_doc_poll["_poller"]["publish_time"]["year"]  = time_d.tm_year+1900;
+      json_doc_poll["_poller"]["publish_time"]["mon"]   = time_d.tm_mon+1;
+      json_doc_poll["_poller"]["publish_time"]["day"]   = time_d.tm_mday;
+      json_doc_poll["_poller"]["publish_time"]["hour"]  = time_d.tm_hour;
+      json_doc_poll["_poller"]["publish_time"]["min"]   = time_d.tm_min;
+      json_doc_poll["_poller"]["publish_time"]["sec"]   = time_d.tm_sec;
     }
 
     // для отслеживания изменения текущего состояния МБ устройства для сторонних MQTT клиентов
@@ -475,11 +476,20 @@ void runNTPUpdateTimer() {
   }
 }
 
+uint8_t strchr_cnt(const char *s, char character) {
+  uint8_t count = 0;
+  while (*s != '\0') {
+    if (character == *s++)
+      count++;
+  }
+  return count;
+}
+
 void setup() {
   // debug comm
   Serial.begin(MONITOR_SPEED);
   while (!Serial) continue;
-  Serial.setDebugOutput(false);
+  Serial.setDebugOutput(true);
 /*
 // TODO(gmasse): fix esp_log_level_set
   esp_log_level_set("*", ESP_LOG_VERBOSE);
