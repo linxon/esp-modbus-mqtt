@@ -84,8 +84,8 @@ QueueHandle_t json_data_queue = NULL;
 static uint16_t volatile modbus_poller_last_crc16_v;
 static bool volatile modbus_poller_force_crc16_chk = false;
 
-void runModbusPollerTimer();
-void runNTPUpdateTimer();
+void runModbusPollerTimer(TimerHandle_t pxTimer);
+void runNTPUpdateTimer(TimerHandle_t pxTimer);
 uint8_t strchr_cnt(const char *s, char character);
 
 void resetWiFi() {
@@ -114,19 +114,13 @@ void wiFiEvent(WiFiEvent_t event) {
       if (!MDNS.begin(HOSTNAME)) {  // init mdns
         ESP_LOGW(TAG, "Error setting up MDNS responder");
       }
-
-      runNTPUpdateTimer(); // сразу же обновляем время при превом запуске
-      if (xTimerStart(ntp_update_timer, 0) == pdFAIL) {
-        ESP_LOGW(TAG, "Unable to start NTP Update timer");
-      }
-
+      runNTPUpdateTimer(NULL);
       connectToMqtt();
       break;
     case SYSTEM_EVENT_STA_DISCONNECTED:
       ESP_LOGW(TAG, "WiFi lost connection");
       xTimerStop(modbus_poller_timer, 0);
       xTimerStop(mqtt_reconnect_timer, 0);
-      xTimerStop(ntp_update_timer, 0);
       xTimerStart(wifi_reconnect_timer, 0);
       break;
     default:
@@ -317,7 +311,7 @@ void runModbusPollerTask(void * pvParameters) {
 
     if (json_doc_poll.isNull()) {
       ESP_LOGE(TAG, "Error: modbus device is not responding!");
-      goto MB_POLLER_SKIP_MQTT;
+      goto MB_POLLER_SKIP_MQTT_PUBLISH;
     }
 
     buff_length = serializeJson(json_doc_poll, json_buffer);
@@ -327,7 +321,7 @@ void runModbusPollerTask(void * pvParameters) {
     if ((curr_crc16_v = crc16_le(0, (uint8_t *) json_buffer, buff_length)) == modbus_poller_last_crc16_v
           && modbus_poller_force_crc16_chk == false)
     {
-      goto MB_POLLER_SKIP_MQTT; // иначе пропускаем
+      goto MB_POLLER_SKIP_MQTT_PUBLISH; // иначе пропускаем
     }
 
     modbus_poller_last_crc16_v = curr_crc16_v;
@@ -350,7 +344,7 @@ void runModbusPollerTask(void * pvParameters) {
 
     MQTT_CLIENT_PUBLISH_DATA(mqtt_client, "current", json_buffer, buff_length);
 
-MB_POLLER_SKIP_MQTT:
+MB_POLLER_SKIP_MQTT_PUBLISH:
     if (eTaskGetState(modbus_main_task_handler) != eSuspended) {
       xSemaphoreGive(modbus_main_semaphore);
     } else {
@@ -365,7 +359,7 @@ MB_POLLER_SKIP_MQTT:
 #endif  // MODBUS_DISABLED
 }
 
-void runModbusPollerTimer() {
+void runModbusPollerTimer(TimerHandle_t pxTimer) {
   if (eTaskGetState(modbus_main_task_handler) == eSuspended) {
     if (xSemaphoreGive(modbus_poller_semaphore) != pdTRUE) {
       ESP_LOGW(TAG, "Unable to give semaphore for Modbus Poller Task");
@@ -437,7 +431,7 @@ void runModbusMainTask(void *pvParameters) {
 #endif  // MODBUS_DISABLED
 }
 
-void runNTPUpdateTimer() {
+void runNTPUpdateTimer(TimerHandle_t pxTimer) {
   time_t curr_time;
   struct tm l_time_d;
 
@@ -520,6 +514,10 @@ void setup() {
     NULL, reinterpret_cast<TimerCallbackFunction_t>(connectToMqtt));
   wifi_reconnect_timer = xTimerCreate("wifi_timer", pdMS_TO_TICKS(2000), pdFALSE,
     NULL, reinterpret_cast<TimerCallbackFunction_t>(connectToWifi));
+  ntp_update_timer = xTimerCreate("ntp_update_timer", pdMS_TO_TICKS(60*1000), pdTRUE,
+    NULL, reinterpret_cast<TimerCallbackFunction_t>(runNTPUpdateTimer));
+
+  xTimerStart(ntp_update_timer, 10);
 
   WiFi.onEvent(wiFiEvent);
 
@@ -573,9 +571,6 @@ void setup() {
   modbus_poller_timer = xTimerCreate("modbus_poller_timer", pdMS_TO_TICKS((MODBUS_SCANRATE)*5u), pdTRUE, NULL,
     reinterpret_cast<TimerCallbackFunction_t>(runModbusPollerTimer));
 #endif  // MODBUS_DISABLED
-
-  ntp_update_timer = xTimerCreate("ntp_update_timer", pdMS_TO_TICKS(60*1000), pdTRUE, NULL,
-    reinterpret_cast<TimerCallbackFunction_t>(runNTPUpdateTimer));
 
   //xTaskCreate(runOtaUpdateTask, "ota_update", 4500u, NULL, 2, &ota_update_task_handler);
   //configASSERT(ota_update_task_handler);
